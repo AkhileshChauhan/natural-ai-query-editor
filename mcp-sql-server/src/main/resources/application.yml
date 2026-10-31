@@ -1,0 +1,32 @@
+server:
+  port: 8081
+
+app:
+  db:
+    url: jdbc:postgresql://localhost:${PG_PORT:5432}/shopdb
+    admin-user: ${POSTGRES_USER:postgres}           # used only for Flyway at startup
+    admin-password: ${POSTGRES_PASSWORD:postgres}
+    app-user: mcp_app
+    app-password: ${MCP_DB_PASSWORD:mcp_app_dev}    # dev default; override outside local dev
+
+spring:
+  flyway:
+    enabled: false                                  # PostgresBootstrapConfig runs Flyway as admin
+  ai:
+    mcp:
+      server:
+        name: mcp-sql-server
+        version: 1.0.0
+        type: SYNC
+
+sqlguard:
+  read-only: false
+  max-rows: 500
+  max-affected-rows: 100
+  query-timeout-seconds: 30
+  write-allowed-tables: [shop.customers, shop.orders, shop.order_items, shop.products]
+  read-denied-columns: [shop.customers.phone]
+
+mcp:
+  security:
+    api-key: ${MCP_API_KEY}
