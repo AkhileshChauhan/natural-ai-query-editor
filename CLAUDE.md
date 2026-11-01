@@ -10,7 +10,7 @@ Build two Spring Boot applications:
    - inspect the schema (tables, columns, foreign keys)
    - run `SELECT` queries, including complex reads: multi-table `JOIN`s, self-joins, CTEs, aggregates, window functions, subqueries
    - run `INSERT` statements
-   - run `UPDATE` statements, which must include a real `WHERE` clause
+   - run `UPDATE` statements on any table, with or without a `WHERE` clause
 
    It must **reject destructive or administrative SQL**: `DELETE`, `TRUNCATE`, `DROP`, `ALTER`, `MERGE`, `COPY`, `CALL`, `DO` and others (full list in §5).
 
@@ -90,12 +90,13 @@ natural-ai-query-editor/
 │       │   ├── SqlGuard.java                 # parse + validate → GuardResult
 │       │   ├── StatementKind.java            # SELECT, INSERT, UPDATE
 │       │   ├── GuardResult.java              # sealed: Allowed(kind, sql) | Rejected(ruleId, reason)
-│       │   ├── BlockedNodeVisitor.java       # walks AST for forbidden constructs/functions
+│       │   ├── SqlScanner.java               # PostgreSQL-accurate lexing: strips comments
+│       │   ├── BlockedNodeVisitor.java       # walks the AST for hidden blocked statements
 │       │   └── QueryRejectedException.java
 │       ├── schema/SchemaService.java         # information_schema / pg_catalog reads, cached
 │       ├── exec/
 │       │   ├── QueryExecutor.java            # read-only TX, LIMIT cap, timeout
-│       │   └── WriteExecutor.java            # INSERT/UPDATE in TX, dry-run, affected-row cap
+│       │   └── WriteExecutor.java            # INSERT/UPDATE in TX, dry-run
 │       ├── tools/
 │       │   ├── SchemaTools.java              # @Tool list_tables, describe_table, schema_overview
 │       │   ├── ReadTools.java                # @Tool run_select
@@ -107,7 +108,8 @@ natural-ai-query-editor/
 │       └── db/migration/                     # ← Flyway scripts (single source of truth)
 │           ├── V1__create_schema.sql
 │           ├── V2__seed_data.sql
-│           └── V3__app_role.sql
+│           ├── V3__app_role.sql
+│           └── V4__update_all_tables.sql
 │   └── src/test/java/...                     # SqlGuardTest, tool ITs, permission IT
 └── sql-client/
     ├── pom.xml
@@ -156,6 +158,7 @@ The container only creates the empty `shopdb`. **Schema, data and roles come fro
    - `V1__create_schema.sql`: schema `shop` + 7 tables + FKs, checks and indexes
    - `V2__seed_data.sql`: sample records
    - `V3__app_role.sql`: least-privilege role `mcp_app`
+   - `V4__update_all_tables.sql`: `UPDATE` on every `shop` table
 
    On later starts Flyway sees they are already applied and does nothing, so **your data changes persist** across restarts.
 3. It re-syncs the `mcp_app` password from `${app.db.app-password}`.
@@ -205,7 +208,7 @@ The container only creates the empty `shopdb`. **Schema, data and roles come fro
 | customer_id | INTEGER identity | PK |
 | first_name, last_name | VARCHAR(50) | NOT NULL |
 | email | VARCHAR(120) | NOT NULL, UNIQUE |
-| phone | VARCHAR(20) | nullable (treated as PII, see §5.4) |
+| phone | VARCHAR(20) | nullable |
 | city | VARCHAR(60) | NOT NULL |
 | state | VARCHAR(40) | nullable |
 | country | VARCHAR(60) | NOT NULL, default 'USA' |
@@ -284,7 +287,7 @@ Business rules the LLM must know (put them in `schema_overview` and the prompt):
 | order_items | 36 | discounts on several lines, historical prices differ from list price |
 | payments | 18 | order 2 paid in two parts; NEW/CANCELLED orders unpaid; **every payment total equals its order total** |
 
-These scripts were tested on PostgreSQL 16. With the `mcp_app` role: SELECT, INSERT and UPDATE work; DELETE, TRUNCATE, DROP, ALTER and CREATE are refused by the database; INSERT into `payments` and UPDATE of `employees` are refused (not on the write allowlist); and `statement_timeout = 30s` is in effect.
+These scripts were tested on PostgreSQL 16. With the `mcp_app` role: SELECT and UPDATE work on every `shop` table; INSERT works on the 4 tables in §5.1; DELETE, TRUNCATE, DROP, ALTER and CREATE are refused by the database; INSERT into `payments`, `employees` or `categories` is refused; and `statement_timeout = 30s` is in effect.
 
 Sample questions the finished app should answer:
 - "Top 5 customers by total spend in 2025" (join + aggregate + `LIMIT`)
@@ -369,11 +372,13 @@ Safety comes from **defence in depth**: the SQL guard, runtime limits, a read-on
 
 | Kind | Allowed | Conditions |
 |---|---|---|
-| `SELECT` (incl. `WITH` CTE, `WITH RECURSIVE`, `JOIN`, `UNION`, subqueries, window functions) | ✅ | Read-only; row cap (§5.3); no `FOR UPDATE/SHARE` |
-| `INSERT INTO … VALUES` / `INSERT INTO … SELECT` (optional `RETURNING`, `ON CONFLICT DO NOTHING`) | ✅ | Target in `sqlguard.write-allowed-tables` |
-| `UPDATE … SET … [FROM …] WHERE …` (optional `RETURNING`) | ✅ | `WHERE` is **mandatory**, references at least one column, and is not trivially true (`1=1`, `TRUE`, `OR 1=1`). Target on the write allowlist |
+| `SELECT` (incl. `WITH` CTE, `WITH RECURSIVE`, `JOIN`, `UNION`, subqueries, window functions) | ✅ | Any table, column or function. Runs read-only with a row cap (§5.3) |
+| `INSERT INTO … VALUES` / `INSERT INTO … SELECT` (optional `RETURNING`, `ON CONFLICT DO NOTHING`) | ✅ | Target in `sqlguard.insert-allowed-tables` |
+| `UPDATE … SET … [FROM …] [WHERE …]` (optional `RETURNING`) | ✅ | Any table, any number of rows, `WHERE` optional |
 
-Write allowlist (matches the DB grants in `V3`): `shop.customers`, `shop.orders`, `shop.order_items`, `shop.products`.
+SELECT and UPDATE have no guard rules beyond being one real SELECT or UPDATE statement. What they can actually touch is limited only by the `mcp_app` grants (§5.4).
+
+INSERT allowlist (matches the DB grants in `V3`): `shop.customers`, `shop.orders`, `shop.order_items`, `shop.products`.
 
 ### 5.2 Blocked (reject with rule id and a readable reason)
 
@@ -385,36 +390,29 @@ Write allowlist (matches the DB grants in `V3`): `shop.customers`, `shop.orders`
 - `GRANT`, `REVOKE`, role or user changes, `SET ROLE`, `SET SESSION AUTHORIZATION`
 - `SET` / `RESET` / `SHOW` session settings, `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` (the server owns transactions)
 - `VACUUM`, `ANALYZE`, `CLUSTER`, `REINDEX`, `LOCK`, `LISTEN` / `NOTIFY`, `DISCARD`
-- `SELECT … FOR UPDATE / FOR SHARE` (row locks)
-- **Dangerous functions anywhere in the AST** (denylist, case-insensitive):
-  - file access: `pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`, `pg_stat_file`, `lo_import`, `lo_export`
-  - stalling and session control: `pg_sleep*`, `pg_terminate_backend`, `pg_cancel_backend`, `pg_reload_conf`, `set_config`
-  - sequence writes: `setval`, `nextval`
-  - other: `dblink*`, `query_to_xml`, `pg_advisory_*`
-- References to `pg_catalog`, `information_schema` or `pg_*` system views in **user** queries (schema discovery goes through the schema tools)
 - **More than one statement** per call
 - Anything JSqlParser cannot parse: **fail closed**
+- Literal forms that could hide a blocked statement from the parser: dollar quoting, `$n` parameters, `U&` strings, backslashes in `E''` strings, and non-ASCII characters outside literals
 
 ### 5.3 Guard and execution rules
 
 1. Parse with `CCJSqlParserUtil.parseStatements(sql)`. Anything other than exactly one statement, or a parse error, is rejected.
 2. Classify by statement type (`Select`, `Insert`, `Update`). Every other type is rejected.
-3. Walk the **whole AST** (`TablesNamesFinder` + custom `BlockedNodeVisitor`) to catch forbidden statements in CTEs or subqueries, denylisted functions, system schemas, `SELECT INTO`, and `FOR UPDATE`.
+3. `SqlScanner` first reads the SQL the way PostgreSQL does, removing comments and the trailing semicolon. `BlockedNodeVisitor` then walks the **whole AST** to catch statements hidden in CTEs or subqueries, and `SELECT INTO`.
 4. Each tool accepts only its own kind (`run_select` → SELECT, …). There is **no** generic `execute_sql` tool.
 5. **Reads** run inside `@Transactional(readOnly = true)`. The Postgres JDBC driver sets the transaction `READ ONLY`, so the database itself rejects any write that slips past the guard.
 6. **Row cap**: wrap the query as `SELECT * FROM (<sql>) AS q LIMIT :max+1` (default `max-rows` 500). If `max+1` rows come back, return `max` rows and `truncated=true`.
 7. **Timeout**: `JdbcTemplate.setQueryTimeout(30)`, plus the role-level `statement_timeout = 30s` set in `V3`.
-8. **Writes**: run with `TransactionTemplate`. If `affectedRows > max-affected-rows` (default 100), roll back with `TOO_MANY_ROWS`. `dryRun=true` executes, reports the count, then always rolls back.
+8. **Writes**: run with `TransactionTemplate`. There is no limit on affected rows. `dryRun=true` executes, reports the count, then always rolls back.
 9. `sqlguard.read-only=true` means the `WriteTools` bean is not registered.
 10. Rejections produce the MCP tool error `REJECTED[RULE_ID]: <message>`. Stack traces never reach the client.
 
-### 5.4 Database role (last line of defence), from `V3__app_role.sql`
+### 5.4 Database role (last line of defence), from `V3__app_role.sql` and `V4__update_all_tables.sql`
 
 - The `mcp_app` role is `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE`, with `search_path = shop`, `statement_timeout = 30s` and `idle_in_transaction_session_timeout = 60s`.
-- `SELECT` on all `shop` tables, `INSERT, UPDATE` only on the 4 allowlisted tables, and `USAGE` on sequences.
+- `SELECT, UPDATE` on all `shop` tables (including tables added by later migrations), `INSERT` only on the 4 allowlisted tables, and `USAGE` on sequences.
 - **No** DELETE, TRUNCATE, REFERENCES, TRIGGER or DDL. Postgres denies anything not granted, and `mcp_app` owns nothing, so DROP and ALTER fail.
 - `CREATE` on `public` is revoked from `PUBLIC`.
-- Column-level PII (e.g. `customers.phone`) is enforced in the guard via `sqlguard.read-denied-columns`. For a hard guarantee, swap the table-level SELECT for column-level grants.
 
 ### 5.5 Injection, identifiers, audit
 
@@ -459,10 +457,8 @@ spring:
 sqlguard:
   read-only: false
   max-rows: 500
-  max-affected-rows: 100
   query-timeout-seconds: 30
-  write-allowed-tables: [shop.customers, shop.orders, shop.order_items, shop.products]
-  read-denied-columns: [shop.customers.phone]
+  insert-allowed-tables: [shop.customers, shop.orders, shop.order_items, shop.products]
 mcp.security.api-key: ${MCP_API_KEY}
 ```
 
@@ -505,7 +501,7 @@ Use `fetch` with JSON and the CSRF token from a meta tag. Render cells with `tex
   - output a single statement and schema-qualify tables (`shop.orders`)
   - use explicit column lists and JOIN on the known FKs
   - compute order totals using the §4.3 rule
-  - UPDATE needs a precise `WHERE`
+  - UPDATE should use a precise `WHERE` unless the user asked to change every row
   - never produce DELETE, TRUNCATE, DDL, MERGE, COPY, CALL, DO or multi-statement batches. Otherwise return `kind=UNSUPPORTED` with an explanation
 - Validate the response: non-empty SQL, a single statement, and a kind that matches the first keyword. Retry once, then show an error.
 
@@ -550,18 +546,17 @@ LLM providers are switched with Maven profiles (`-Panthropic` default, `-Popenai
     - window functions
     - `INSERT … RETURNING`
     - `UPDATE … FROM … WHERE`
+    - unrestricted reads and updates: `UPDATE t SET a=1` (no WHERE), `SELECT pg_sleep(1)`, `SELECT * FROM pg_catalog.pg_class`, `SELECT … FOR UPDATE`
   - blocked:
     - plain destructive statements: `DELETE`, `TRUNCATE`, `DROP`, `SELECT 1; DROP TABLE x`
     - data-modifying CTEs: `WITH d AS (DELETE FROM shop.orders RETURNING *) SELECT * FROM d`
-    - unsafe UPDATEs: `UPDATE t SET a=1` (no WHERE), `… WHERE true`, `… WHERE id=1 OR 1=1`
     - object creation and server-side code: `SELECT * INTO x FROM t`, `COPY t TO PROGRAM 'ls'`, `DO $$ … $$`, `CALL p()`
-    - denylisted functions and locks: `SELECT pg_sleep(60)`, `SELECT pg_read_file('/etc/passwd')`, `SELECT setval(...)`, `SELECT … FOR UPDATE`
-    - session and system access: `SET ROLE postgres`, references to `pg_catalog.pg_authid`
+    - session changes: `SET ROLE postgres`
     - obfuscation: comment tricks, mixed case, odd whitespace and unicode
 - **Server integration tests** (`@SpringBootTest` + Testcontainers `postgres:16-alpine`, fresh DB per test class):
   - every tool against the seed data
   - known answers: 20 orders, 12 customers, customers 8 and 12 have no orders, order 2 total = 1272.53
-  - row cap, timeout (heavy `generate_series` cross join), the affected-rows rollback and dry run
+  - row cap, timeout (heavy `generate_series` cross join) and dry run
 - **Permission IT**: as `mcp_app`, raw `DELETE`, `TRUNCATE`, `DROP` and INSERT into `payments` all fail with `permission denied` / `must be owner`. This proves the DB layer holds even with the guard bypassed.
 - **Startup IT**: the app boots twice against the same container and Flyway does not re-apply or fail. With the DB down, startup fails with the "did you run docker compose up -d" message.
 - **Client tests**:
@@ -588,7 +583,7 @@ Commands: `./mvnw test`, `./mvnw verify -Pit`.
 1. Maven parent + modules. `docker compose up -d`, `PostgresBootstrapConfig` + Flyway V1–V3. The app boots and seed data is queryable as `mcp_app`
 2. `SqlGuard` + exhaustive unit tests
 3. Server: `SchemaService`, `SchemaTools`, `ReadTools`, verified in MCP Inspector
-4. Server: `WriteTools` (TX, dry run, affected-row cap), API-key security, audit log
+4. Server: `WriteTools` (TX, dry run), API-key security, audit log
 5. Client: MCP connection + `SqlExecutionService` (run a hard-coded SELECT end to end)
 6. Client: `SqlGenerationService` (ChatClient + schema tools + structured output)
 7. Client: web page (generate, edit, run, results table) and the UPDATE/INSERT preview → confirm flow

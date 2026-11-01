@@ -22,10 +22,8 @@ spring:
 sqlguard:
   read-only: false
   max-rows: 500
-  max-affected-rows: 100
   query-timeout-seconds: 30
-  write-allowed-tables: [shop.customers, shop.orders, shop.order_items, shop.products]
-  read-denied-columns: [shop.customers.phone]
+  insert-allowed-tables: [shop.customers, shop.orders, shop.order_items, shop.products]
 
 mcp:
   security:
