@@ -1,0 +1,19 @@
+server:
+  port: 8080
+
+spring:
+  ai:
+    mcp:
+      client:
+        name: sql-client
+        type: SYNC
+        request-timeout: 60s
+        sse:
+          connections:
+            sql:
+              url: ${MCP_SERVER_URL:http://localhost:8081}
+
+app:
+  mcp:
+    api-key: ${MCP_API_KEY}
+  smoke-select: false

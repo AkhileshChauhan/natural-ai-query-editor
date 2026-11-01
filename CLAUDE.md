@@ -55,7 +55,7 @@ Build two Spring Boot applications:
 | AI | Spring AI (**Spring AI BOM** matching the Boot version) | Never mix Spring AI versions across modules |
 | MCP server | `spring-ai-starter-mcp-server-webmvc` | `@Tool` methods + `MethodToolCallbackProvider` bean |
 | MCP client | `spring-ai-starter-mcp-client` | Gives `McpSyncClient` and `ToolCallbackProvider` beans |
-| LLM | `spring-ai-starter-model-anthropic` (default); OpenAI / Azure OpenAI / Ollama starters via Maven profiles | Code depends only on `ChatClient` |
+| LLM | `spring-ai-starter-model-openai` pointed at **OpenRouter** (default, model from `LLM_MODEL`: NVIDIA Nemotron 3 Ultra free tier); Anthropic / Azure OpenAI / Ollama starters via Maven profiles | Code depends only on `ChatClient` |
 | Database | **PostgreSQL 16** in Docker (`postgres:16-alpine`) via `docker-compose.yml` | Port 5432 on 127.0.0.1, data in named volume `pgdata`; optional pgAdmin on :5050 |
 | Migrations / seed | **Flyway** (`flyway-core` + `flyway-database-postgresql`), run programmatically at startup | Scripts in `db/migration` (§4) |
 | JDBC | `org.postgresql:postgresql` + HikariCP + `JdbcTemplate` / `NamedParameterJdbcTemplate` | No JPA: we run native SQL |
@@ -85,7 +85,9 @@ natural-ai-query-editor/
 │       ├── config/
 │       │   ├── SqlGuardProperties.java       # @ConfigurationProperties("sqlguard")
 │       │   ├── ToolConfig.java               # MethodToolCallbackProvider bean
-│       │   └── SecurityConfig.java           # API-key filter on MCP endpoint
+│       │   ├── SecurityConfig.java           # X-API-Key required everywhere but /actuator/health
+│       │   ├── ApiKeyFilter.java             # constant-time key check
+│       │   └── McpSecurityProperties.java    # @ConfigurationProperties("mcp.security")
 │       ├── guard/
 │       │   ├── SqlGuard.java                 # parse + validate → GuardResult
 │       │   ├── StatementKind.java            # SELECT, INSERT, UPDATE
@@ -96,10 +98,12 @@ natural-ai-query-editor/
 │       ├── schema/SchemaService.java         # information_schema / pg_catalog reads, cached
 │       ├── exec/
 │       │   ├── QueryExecutor.java            # read-only TX, LIMIT cap, timeout
+│       │   ├── RowReader.java                # result rows to the JSON shapes in §6
 │       │   ├── WriteExecutor.java            # INSERT/UPDATE in TX, dry-run
 │       │   └── QueryExecutionException.java  # TIMEOUT / DB_ERROR tool errors
 │       ├── tools/
 │       │   ├── SchemaTools.java              # @Tool list_tables, describe_table, schema_overview
+│       │   ├── GuardedSql.java               # the one path to the DB: guard, execute, audit
 │       │   ├── ReadTools.java                # @Tool run_select
 │       │   ├── WriteTools.java               # @Tool run_insert, run_update
 │       │   └── PlainTextResultConverter.java # schema_overview as raw text, not a JSON string
@@ -107,6 +111,7 @@ natural-ai-query-editor/
 │       └── audit/AuditLogger.java
 │   └── src/main/resources/
 │       ├── application.yml
+│       ├── logback-spring.xml                # mcp.audit logger → logs/audit.log
 │       └── db/migration/                     # ← Flyway scripts (single source of truth)
 │           ├── V1__create_schema.sql
 │           ├── V2__seed_data.sql
@@ -117,9 +122,10 @@ natural-ai-query-editor/
     ├── pom.xml
     └── src/main/java/com/example/mcpsql/client/
         ├── McpSqlClientApplication.java
-        ├── config/{ChatClientConfig, SecurityConfig}.java
+        ├── config/{ChatClientConfig, SecurityConfig, McpClientConfig, McpConnectionProperties}.java
         ├── web/{PageController, QueryController, ApiExceptionHandler}.java
-        ├── service/{SqlGenerationService, SqlExecutionService, McpToolInvoker, PreviewTokenService}.java
+        ├── service/{SqlGenerationService, SqlExecutionService, McpToolInvoker, McpToolException,
+        │            PreviewTokenService, SmokeSelectRunner}.java
         ├── dto/{GenerateRequest, GeneratedSql, ExecuteRequest, ConfirmRequest,
         │        SelectResult, WriteResult, ApiError}.java
         └── prompt/SqlPrompts.java
@@ -420,7 +426,7 @@ INSERT allowlist (matches the DB grants in `V3`): `shop.customers`, `shop.orders
 
 - SQL from the LLM or the user is **untrusted input** and always goes through `SqlGuard`.
 - Validate identifiers against `SchemaService` metadata and double-quote them. Use bind parameters for values.
-- `AuditLogger` writes one JSON line per tool call: caller, tool, normalized SQL, decision and rule id, dry-run flag, duration, row count or affected rows, error code. Never log secrets or result data.
+- `AuditLogger` writes one JSON line per tool call to `logs/audit.log` (override with `AUDIT_LOG_FILE`, 30 days kept): timestamp, caller, tool, normalized SQL, decision and rule id, dry-run flag, duration, row count or affected rows, error code. Never log secrets or result data. `caller` is the name the MCP client declared, because all clients share one API key.
 
 ## 6. MCP Server: Tool Contract
 
@@ -442,6 +448,8 @@ ToolCallbackProvider sqlTools(SchemaTools schema, ReadTools read, ObjectProvider
 | `run_insert` | `sql`, `dryRun` | `{affectedRows, committed, dryRun, returning?}` |
 | `run_update` | `sql`, `dryRun` | `{affectedRows, committed, dryRun, returning?}` |
 
+- Every request except `/actuator/health` needs the `X-API-Key` header with `mcp.security.api-key`; otherwise it gets a 401. The server will not start without a key.
+- `dryRun` is required on `run_insert` and `run_update`, and a call that omits it is refused. Only an explicit `false` commits.
 - Tool descriptions state the dialect (PostgreSQL), the limits, and that DELETE/TRUNCATE/DDL are rejected.
 - Serialize `BigDecimal` as a string, temporal types as ISO-8601 and `bytea` as base64. Show JSON values as strings.
 
@@ -464,7 +472,7 @@ sqlguard:
 mcp.security.api-key: ${MCP_API_KEY}
 ```
 
-Verify with MCP Inspector (`npx @modelcontextprotocol/inspector`) before building the client.
+Verify with MCP Inspector (`npx @modelcontextprotocol/inspector`) before building the client, adding `X-API-Key` as a custom header.
 
 ## 7. Client Web Application
 
@@ -497,7 +505,9 @@ Use `fetch` with JSON and the CSRF token from a meta tag. Render cells with `tex
 - Build a `ChatClient` with the system prompt `prompts/sql-generator.st`.
 - Give the ChatClient **only the schema tools** (`list_tables`, `describe_table`, `schema_overview`), filtered by name from the MCP `ToolCallbackProvider`. For a schema this small, you can instead inject `schema_overview` text straight into the prompt.
 - **Never** register `run_*` tools with the ChatClient.
-- Use structured output: `.call().entity(GeneratedSql.class)`.
+- Use structured output: `.call().entity(GeneratedSql.class)`. The free Nemotron endpoint has no `response_format`, so JSON comes only from the prompt instructions and is not enforced: strip code fences before parsing, and treat bad JSON as a failed attempt for the retry below.
+- Inject `schema_overview` into the prompt rather than relying on tool calls, because free endpoints are rate limited and each tool round trip costs a request.
+- The free endpoint logs prompts for NVIDIA's use. Send only the question and the schema, **never** query results or row data.
 - Prompt rules:
   - write **PostgreSQL** syntax: `LIMIT`, `ILIKE`, `date_trunc`, `EXTRACT`, `::` casts, `COALESCE`
   - output a single statement and schema-qualify tables (`shop.orders`)
@@ -509,8 +519,8 @@ Use `fetch` with JSON and the CSRF token from a meta tag. Render cells with `tex
 
 ### 7.4 SQL execution (`SqlExecutionService`)
 
-- Inject `List<McpSyncClient>` and pick the `sql` connection.
-- Call `mcpClient.callTool(new McpSchema.CallToolRequest("run_select", Map.of("sql", sql)))`. If `isError()` is true, throw `McpToolException`. Otherwise parse the JSON text content into DTOs.
+- `McpToolInvoker` injects `List<McpSyncClient>` and picks the `sql` connection, which Spring AI names `sql-client - sql`. That name is also the `caller` in the server's audit log.
+- Call `mcpClient.callTool(new McpSchema.CallToolRequest("run_select", Map.of("sql", sql)))`. If `isError()` is true, throw `McpToolException` with the server's text. If the call itself fails, throw `MCP_UNAVAILABLE`, and if the result cannot be parsed, `MCP_BAD_RESPONSE`, without exposing details. Otherwise parse the JSON text content into DTOs.
 - UPDATE/INSERT: `execute` makes a `dryRun=true` call and returns a token. `confirm` verifies the token, then calls with `dryRun=false`.
 
 Client `application.yml` (indicative):
@@ -519,8 +529,9 @@ Client `application.yml` (indicative):
 server.port: 8080
 spring:
   ai:
-    anthropic:
-      api-key: ${ANTHROPIC_API_KEY}
+    openai:
+      api-key: ${OPENROUTER_API_KEY}
+      base-url: ${LLM_BASE_URL:https://openrouter.ai/api/v1}   # confirm /api vs /api/v1 with a first real call
       chat.options:
         model: ${LLM_MODEL}          # never hard-code model names in Java
         temperature: 0.0
@@ -533,11 +544,14 @@ spring:
             sql:
               url: ${MCP_SERVER_URL:http://localhost:8081}
 app:
+  mcp:
+    api-key: ${MCP_API_KEY}          # McpClientConfig sends it as X-API-Key on every request
+  smoke-select: false                # true runs one hard-coded SELECT at startup
   preview-token-secret: ${PREVIEW_TOKEN_SECRET}
   preview-token-ttl: 5m
 ```
 
-LLM providers are switched with Maven profiles (`-Panthropic` default, `-Popenai`, `-Pazure`, `-Pollama`), with no Java changes.
+LLM providers are switched with Maven profiles (`-Popenrouter` default, `-Panthropic`, `-Pazure`, `-Pollama`), with no Java changes.
 
 ## 8. Testing Requirements
 

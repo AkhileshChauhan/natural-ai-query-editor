@@ -1,0 +1,3 @@
+mcp:
+  security:
+    api-key: test-api-key

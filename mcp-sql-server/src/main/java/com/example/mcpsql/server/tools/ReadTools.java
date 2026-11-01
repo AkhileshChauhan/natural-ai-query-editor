@@ -2,10 +2,8 @@ package com.example.mcpsql.server.tools;
 
 import com.example.mcpsql.server.dto.QueryResult;
 import com.example.mcpsql.server.exec.QueryExecutor;
-import com.example.mcpsql.server.guard.GuardResult;
-import com.example.mcpsql.server.guard.QueryRejectedException;
-import com.example.mcpsql.server.guard.SqlGuard;
 import com.example.mcpsql.server.guard.StatementKind;
+import org.springframework.ai.chat.model.ToolContext;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
@@ -13,11 +11,11 @@ import org.springframework.stereotype.Component;
 @Component
 public class ReadTools {
 
-    private final SqlGuard guard;
+    private final GuardedSql guardedSql;
     private final QueryExecutor executor;
 
-    public ReadTools(SqlGuard guard, QueryExecutor executor) {
-        this.guard = guard;
+    ReadTools(GuardedSql guardedSql, QueryExecutor executor) {
+        this.guardedSql = guardedSql;
         this.executor = executor;
     }
 
@@ -28,10 +26,9 @@ public class ReadTools {
             DELETE, TRUNCATE, DDL and multiple statements are rejected.""")
     public QueryResult runSelect(
             @ToolParam(description = "A single PostgreSQL SELECT statement") String sql,
-            @ToolParam(description = "Optional lower row limit for this call", required = false) Integer maxRows) {
-        return switch (guard.check(sql, StatementKind.SELECT)) {
-            case GuardResult.Allowed allowed -> executor.select(allowed.sql(), maxRows);
-            case GuardResult.Rejected rejected -> throw new QueryRejectedException(rejected.ruleId(), rejected.reason());
-        };
+            @ToolParam(description = "Optional lower row limit for this call", required = false) Integer maxRows,
+            ToolContext context) {
+        return guardedSql.run(context, "run_select", sql, StatementKind.SELECT, null,
+                allowed -> executor.select(allowed, maxRows), QueryResult::rowCount);
     }
 }

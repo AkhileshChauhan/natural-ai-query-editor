@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.example.mcpsql.server.exec.QueryExecutionException;
 import com.example.mcpsql.server.exec.QueryExecutor;
+import com.example.mcpsql.server.exec.WriteExecutor;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -32,6 +33,9 @@ class QueryTimeoutIT {
     @Autowired
     QueryExecutor executor;
 
+    @Autowired
+    WriteExecutor writer;
+
     @Test
     void cancelsLongQueriesAndTheConnectionStaysUsable() {
         String heavy = "SELECT count(*) FROM generate_series(1, 100000000) a CROSS JOIN generate_series(1, 100000000) b";
@@ -40,5 +44,17 @@ class QueryTimeoutIT {
                 .isInstanceOf(QueryExecutionException.class)
                 .hasMessageStartingWith("TIMEOUT:");
         assertThat(executor.select("SELECT 1", null).rowCount()).isEqualTo(1);
+    }
+
+    @Test
+    void cancelsLongWritesAndLeavesTheDataUnchanged() {
+        String heavy = """
+                UPDATE shop.products SET stock_qty = stock_qty + 1
+                WHERE product_id = (SELECT count(*) FROM generate_series(1, 100000000) a CROSS JOIN generate_series(1, 100000000) b)
+                """;
+
+        assertThatThrownBy(() -> writer.execute(heavy, false))
+                .isInstanceOf(QueryExecutionException.class)
+                .hasMessageStartingWith("TIMEOUT:");
     }
 }

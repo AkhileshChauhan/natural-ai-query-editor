@@ -10,6 +10,8 @@ app:
     app-password: ${MCP_DB_PASSWORD:mcp_app_dev}    # dev default; override outside local dev
 
 spring:
+  autoconfigure:
+    exclude: org.springframework.boot.security.autoconfigure.UserDetailsServiceAutoConfiguration   # the API key is the only credential
   flyway:
     enabled: false                                  # PostgresBootstrapConfig runs Flyway as admin
   ai:

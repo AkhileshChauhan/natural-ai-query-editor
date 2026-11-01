@@ -2,13 +2,17 @@ package com.example.mcpsql.server.tools;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import io.modelcontextprotocol.client.McpClient;
-import io.modelcontextprotocol.client.McpSyncClient;
-import io.modelcontextprotocol.client.transport.HttpClientSseClientTransport;
 import io.modelcontextprotocol.spec.McpSchema;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -25,7 +29,6 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
-/** Calls the tools the way MCP Inspector and the client do: over the wire, through a real MCP session. */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @Testcontainers
 class McpToolsIT {
@@ -46,31 +49,28 @@ class McpToolsIT {
     @Value("${local.server.port}")
     int port;
 
-    McpSyncClient client;
+    McpTestClient client;
 
     @BeforeEach
     void connect() {
-        client = McpClient.sync(HttpClientSseClientTransport.builder("http://localhost:" + port).build()).build();
-        client.initialize();
+        client = new McpTestClient(port);
     }
 
     @AfterEach
     void disconnect() {
-        client.closeGracefully();
+        client.close();
     }
 
     private McpSchema.CallToolResult call(String tool, Map<String, Object> arguments) {
-        return client.callTool(new McpSchema.CallToolRequest(tool, arguments));
+        return client.call(tool, arguments);
     }
 
     private static String text(McpSchema.CallToolResult result) {
-        return ((McpSchema.TextContent) result.content().getFirst()).text();
+        return McpTestClient.text(result);
     }
 
     private JsonNode ok(String tool, Map<String, Object> arguments) {
-        McpSchema.CallToolResult result = call(tool, arguments);
-        assertThat(result.isError()).as(text(result)).isFalse();
-        return JSON.readTree(text(result));
+        return client.ok(tool, arguments);
     }
 
     private JsonNode select(String sql) {
@@ -78,9 +78,18 @@ class McpToolsIT {
     }
 
     private String error(String sql) {
-        McpSchema.CallToolResult result = call("run_select", Map.of("sql", sql));
-        assertThat(result.isError()).as(text(result)).isTrue();
-        return text(result);
+        return client.error("run_select", Map.of("sql", sql));
+    }
+
+    private int status(HttpRequest.Builder request) throws Exception {
+        try (HttpClient http = HttpClient.newHttpClient()) {
+            return http.send(request.timeout(Duration.ofSeconds(5)).build(), HttpResponse.BodyHandlers.discarding())
+                    .statusCode();
+        }
+    }
+
+    private HttpRequest.Builder request(String path) {
+        return HttpRequest.newBuilder(URI.create("http://localhost:" + port + path));
     }
 
     private static List<String> firstColumn(JsonNode result) {
@@ -90,20 +99,25 @@ class McpToolsIT {
     }
 
     @Test
-    void listsExactlyTheReadAndSchemaTools() {
-        List<String> names = client.listTools().tools().stream().map(McpSchema.Tool::name).toList();
+    void listsExactlyTheContractTools() {
+        List<String> names = client.tools().stream().map(McpSchema.Tool::name).toList();
 
-        assertThat(names).containsExactlyInAnyOrder("list_tables", "describe_table", "schema_overview", "run_select");
+        assertThat(names).containsExactlyInAnyOrder(
+                "list_tables", "describe_table", "schema_overview", "run_select", "run_insert", "run_update");
     }
 
     @Test
     void toolDescriptionsStateDialectAndRejections() {
-        McpSchema.Tool tool = client.listTools().tools().stream()
-                .filter(candidate -> candidate.name().equals("run_select"))
-                .findFirst().orElseThrow();
+        Map<String, McpSchema.Tool> tools = client.tools().stream()
+                .collect(Collectors.toMap(McpSchema.Tool::name, Function.identity()));
 
-        assertThat(tool.description()).contains("PostgreSQL", "DELETE", "TRUNCATE", "DDL");
-        assertThat(JSON.valueToTree(tool.inputSchema()).get("required").toString()).isEqualTo("[\"sql\"]");
+        for (String name : List.of("run_select", "run_insert", "run_update")) {
+            assertThat(tools.get(name).description()).contains("PostgreSQL", "DELETE", "TRUNCATE", "DDL");
+        }
+        assertThat(JSON.valueToTree(tools.get("run_select").inputSchema()).get("required").toString()).isEqualTo("[\"sql\"]");
+        assertThat(JSON.valueToTree(tools.get("run_update").inputSchema()).get("required").toString())
+                .isEqualTo("[\"sql\",\"dryRun\"]");
+        assertThat(JSON.valueToTree(tools.get("run_select").inputSchema()).get("properties").has("context")).isFalse();
     }
 
     @Test
@@ -288,5 +302,23 @@ class McpToolsIT {
 
         assertThat(message).contains("DB_ERROR", "no_such_column");
         assertThat(message).doesNotContain("\n", "Exception", "\tat ");
+    }
+
+    @Test
+    void refusesRequestsWithoutTheApiKey() throws Exception {
+        assertThat(status(request("/sse").GET())).isEqualTo(401);
+        assertThat(status(request("/mcp/message?sessionId=x").POST(HttpRequest.BodyPublishers.ofString("{}")))).isEqualTo(401);
+        assertThat(status(request("/actuator/info").GET())).isEqualTo(401);
+    }
+
+    @Test
+    void refusesAWrongApiKey() throws Exception {
+        assertThat(status(request("/sse").header(McpTestClient.API_KEY_HEADER, "wrong").GET())).isEqualTo(401);
+        assertThat(status(request("/sse").header(McpTestClient.API_KEY_HEADER, "").GET())).isEqualTo(401);
+    }
+
+    @Test
+    void leavesTheHealthCheckOpen() throws Exception {
+        assertThat(status(request("/actuator/health").GET())).isEqualTo(200);
     }
 }
