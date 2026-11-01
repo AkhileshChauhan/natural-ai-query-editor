@@ -96,11 +96,13 @@ natural-ai-query-editor/
 │       ├── schema/SchemaService.java         # information_schema / pg_catalog reads, cached
 │       ├── exec/
 │       │   ├── QueryExecutor.java            # read-only TX, LIMIT cap, timeout
-│       │   └── WriteExecutor.java            # INSERT/UPDATE in TX, dry-run
+│       │   ├── WriteExecutor.java            # INSERT/UPDATE in TX, dry-run
+│       │   └── QueryExecutionException.java  # TIMEOUT / DB_ERROR tool errors
 │       ├── tools/
 │       │   ├── SchemaTools.java              # @Tool list_tables, describe_table, schema_overview
 │       │   ├── ReadTools.java                # @Tool run_select
-│       │   └── WriteTools.java               # @Tool run_insert, run_update
+│       │   ├── WriteTools.java               # @Tool run_insert, run_update
+│       │   └── PlainTextResultConverter.java # schema_overview as raw text, not a JSON string
 │       ├── dto/                              # QueryResult, WriteResult, TableInfo, ColumnInfo…
 │       └── audit/AuditLogger.java
 │   └── src/main/resources/
