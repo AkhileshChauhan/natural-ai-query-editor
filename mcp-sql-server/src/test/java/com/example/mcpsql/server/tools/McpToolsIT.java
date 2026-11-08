@@ -173,6 +173,15 @@ class McpToolsIT {
     }
 
     @Test
+    void reportsTheValuesCheckConstraintsAllow() {
+        String overview = text(call("schema_overview", Map.of()));
+        JsonNode customers = ok("describe_table", Map.of("table", "customers"));
+
+        assertThat(overview).contains("BRONZE", "PLATINUM", "CANCELLED", "GIFT_CARD");
+        assertThat(customers.get("checks").toString()).contains("BRONZE");
+    }
+
+    @Test
     void returnsColumnsRowsAndCounts() {
         JsonNode result = select("SELECT customer_id, city FROM shop.customers WHERE customer_id = 1");
 

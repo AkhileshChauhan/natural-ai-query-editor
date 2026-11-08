@@ -1,0 +1,16 @@
+spring:
+  security:
+    user:
+      name: tester
+      password: test-password
+  ai:
+    openai:
+      api-key: test-llm-key
+      chat:
+        model: test-model
+
+app:
+  mcp:
+    api-key: test-mcp-key
+  preview:
+    secret: test-secret-that-is-at-least-32-characters

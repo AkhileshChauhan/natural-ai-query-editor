@@ -8,5 +8,6 @@ public record TableDetail(
         String comment,
         List<ColumnInfo> columns,
         List<ForeignKeyInfo> foreignKeys,
+        List<String> checks,
         List<IndexInfo> indexes) {
 }

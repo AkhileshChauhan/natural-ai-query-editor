@@ -76,6 +76,15 @@ public class SchemaService {
             ORDER BY con.conname
             """;
 
+    private static final String CHECKS_SQL = """
+            SELECT pg_get_constraintdef(con.oid) AS definition
+            FROM pg_constraint con
+            JOIN pg_class c ON c.oid = con.conrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE con.contype = 'c' AND n.nspname = ? AND c.relname = ?
+            ORDER BY con.conname
+            """;
+
     private static final String INDEXES_SQL = """
             SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = ? AND tablename = ? ORDER BY indexname
             """;
@@ -105,7 +114,7 @@ public class SchemaService {
         return details.computeIfAbsent(name, key -> loadDetail(info));
     }
 
-    /** Every table, column and foreign key as compact text, followed by the business rules. */
+    /** Every table, column, foreign key and check constraint as compact text, then the business rules. */
     public String overview() {
         String text = overview;
         if (text == null) {
@@ -137,16 +146,18 @@ public class SchemaService {
                 List.of(rs.getString("columns").split(COLUMN_SEPARATOR)),
                 rs.getString("referenced_table"),
                 List.of(rs.getString("referenced_columns").split(COLUMN_SEPARATOR))), SCHEMA, name);
+        List<String> checks = jdbc.query(CHECKS_SQL, (rs, n) -> rs.getString("definition"), SCHEMA, name);
         List<IndexInfo> indexes = jdbc.query(INDEXES_SQL,
                 (rs, n) -> new IndexInfo(rs.getString("indexname"), rs.getString("indexdef")), SCHEMA, name);
-        return new TableDetail(SCHEMA, name, info.comment(), columns, foreignKeys, indexes);
+        return new TableDetail(SCHEMA, name, info.comment(), columns, foreignKeys, checks, indexes);
     }
 
     private static String summarize(TableDetail table) {
         String columns = table.columns().stream()
                 .map(column -> summarize(column, table.foreignKeys()))
                 .collect(Collectors.joining(", "));
-        return table.schema() + "." + table.table() + "(" + columns + ")";
+        String checks = table.checks().stream().map(check -> "\n  " + check).collect(Collectors.joining());
+        return table.schema() + "." + table.table() + "(" + columns + ")" + checks;
     }
 
     private static String summarize(ColumnInfo column, List<ForeignKeyInfo> foreignKeys) {

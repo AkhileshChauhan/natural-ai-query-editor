@@ -122,13 +122,14 @@ natural-ai-query-editor/
     ├── pom.xml
     └── src/main/java/com/example/mcpsql/client/
         ├── McpSqlClientApplication.java
-        ├── config/{ChatClientConfig, SecurityConfig, McpClientConfig, McpConnectionProperties}.java
+        ├── config/{ChatClientConfig, SecurityConfig, McpClientConfig, McpConnectionProperties,
+        │           PreviewProperties}.java
         ├── web/{PageController, QueryController, ApiExceptionHandler}.java
-        ├── service/{SqlGenerationService, SqlExecutionService, McpToolInvoker, McpToolException,
-        │            PreviewTokenService, SmokeSelectRunner}.java
-        ├── dto/{GenerateRequest, GeneratedSql, ExecuteRequest, ConfirmRequest,
-        │        SelectResult, WriteResult, ApiError}.java
-        └── prompt/SqlPrompts.java
+        ├── service/{SqlGenerationService, GeneratedSqlConverter, SqlGenerationException,
+        │            SqlExecutionService, SqlClassifier, McpToolInvoker, McpToolException,
+        │            PreviewTokenService, PreviewTokenException}.java
+        └── dto/{GenerateRequest, GeneratedSql, ExecuteRequest, ExecuteResponse, ConfirmRequest,
+                 SelectResult, WriteResult, TableInfo, StatementKind, ApiError}.java
     └── src/main/resources/
         ├── application.yml
         ├── prompts/sql-generator.st
@@ -442,8 +443,8 @@ ToolCallbackProvider sqlTools(SchemaTools schema, ReadTools read, ObjectProvider
 | Tool | Parameters | Returns (JSON) |
 |---|---|---|
 | `list_tables` | – | `[{schema, table, rowEstimate, comment}]` |
-| `describe_table` | `table` (`shop.orders` or `orders`) | columns (name, type, nullable, default, PK, comment), FKs, indexes |
-| `schema_overview` | – | compact text: every table/column/FK plus the business rules from §4.3 |
+| `describe_table` | `table` (`shop.orders` or `orders`) | columns (name, type, nullable, default, PK, comment), FKs, check constraints, indexes |
+| `schema_overview` | – | compact text: every table/column/FK/check constraint plus the business rules from §4.3 |
 | `run_select` | `sql`, `maxRows?` | `{columns, rows, rowCount, truncated, elapsedMs}` |
 | `run_insert` | `sql`, `dryRun` | `{affectedRows, committed, dryRun, returning?}` |
 | `run_update` | `sql`, `dryRun` | `{affectedRows, committed, dryRun, returning?}` |
@@ -493,12 +494,14 @@ Use `fetch` with JSON and the CSRF token from a meta tag. Render cells with `tex
 | Method & path | Body | Response |
 |---|---|---|
 | `POST /api/sql/generate` | `{question}` | `GeneratedSql {sql, kind, explanation, tablesUsed}` |
-| `POST /api/sql/execute` | `{sql}` | SELECT → `SelectResult`; UPDATE/INSERT → `WriteResult` (dry run) + `previewToken` |
+| `POST /api/sql/execute` | `{sql}` | `ExecuteResponse {kind, select, write, previewToken}`: SELECT fills `select`; UPDATE/INSERT fills `write` (dry run) and `previewToken` |
 | `POST /api/sql/confirm` | `{sql, previewToken}` | `WriteResult` with `committed=true` |
 | `GET /api/schema/tables` | – | table list for a sidebar |
 
-- `previewToken` is an HMAC over (normalized SQL + user + issued-at) with a 5-minute TTL. `confirm` runs only the exact SQL that was previewed.
-- `@RestControllerAdvice` maps `REJECTED[...]` → 422, `TIMEOUT` → 504, `DB_ERROR` → 502, all returned as `ApiError`.
+- `previewToken` is an HMAC over (normalized SQL + user + issued-at) with a 5-minute TTL. It works once, so a double click cannot apply a write twice. `confirm` runs only the exact SQL that was previewed; anything else gets `PREVIEW_INVALID` → 409.
+- `SqlClassifier` routes `/execute` with JSqlParser, because `WITH … UPDATE` has no telling first keyword. It only routes: unrecognised SQL goes to `run_select`, so the server's rejection reaches the user.
+- `@RestControllerAdvice` maps `REJECTED[...]` → 422, `TIMEOUT` → 504, `DB_ERROR` → 502, `MCP_UNAVAILABLE` → 503, `GENERATION_FAILED` → 502, all returned as `ApiError`.
+- Signed-out page requests redirect to `/login`; signed-out `/api/**` calls get a 401.
 
 ### 7.3 SQL generation (`SqlGenerationService`)
 
@@ -519,8 +522,9 @@ Use `fetch` with JSON and the CSRF token from a meta tag. Render cells with `tex
 
 ### 7.4 SQL execution (`SqlExecutionService`)
 
-- `McpToolInvoker` injects `List<McpSyncClient>` and picks the `sql` connection, which Spring AI names `sql-client - sql`. That name is also the `caller` in the server's audit log.
-- Call `mcpClient.callTool(new McpSchema.CallToolRequest("run_select", Map.of("sql", sql)))`. If `isError()` is true, throw `McpToolException` with the server's text. If the call itself fails, throw `MCP_UNAVAILABLE`, and if the result cannot be parsed, `MCP_BAD_RESPONSE`, without exposing details. Otherwise parse the JSON text content into DTOs.
+- `McpClientConfig` builds connections itself, with Spring AI's MCP client auto-configuration turned off, because that client is one fixed bean that cannot recover after the server restarts. Its name, `sql-client`, is the `caller` in the server's audit log.
+- `McpToolInvoker` connects on first use and pings before each call, replacing a dead connection. It never resends a failed call, because a write may already have been applied.
+- Call `client.callTool(new McpSchema.CallToolRequest("run_select", Map.of("sql", sql)))`. If `isError()` is true, throw `McpToolException` with the server's text. If the call itself fails, throw `MCP_UNAVAILABLE`, and if the result cannot be parsed, `MCP_BAD_RESPONSE`, without exposing details. Otherwise parse the JSON text content into DTOs.
 - UPDATE/INSERT: `execute` makes a `dryRun=true` call and returns a token. `confirm` verifies the token, then calls with `dryRun=false`.
 
 Client `application.yml` (indicative):
@@ -531,24 +535,28 @@ spring:
   ai:
     openai:
       api-key: ${OPENROUTER_API_KEY}
-      base-url: ${LLM_BASE_URL:https://openrouter.ai/api/v1}   # confirm /api vs /api/v1 with a first real call
-      chat.options:
+      base-url: ${LLM_BASE_URL:https://openrouter.ai/api/v1}
+      chat:
         model: ${LLM_MODEL}          # never hard-code model names in Java
         temperature: 0.0
+        timeout: 60s
+        max-retries: 1               # free endpoints are rate limited, so fail fast
     mcp:
       client:
-        type: SYNC
-        request-timeout: 60s
-        sse:                          # or streamable-http, matching the server transport
-          connections:
-            sql:
-              url: ${MCP_SERVER_URL:http://localhost:8081}
+        enabled: false               # McpClientConfig builds connections
+  security:
+    user:
+      name: ${APP_USERNAME}
+      password: ${APP_PASSWORD}
 app:
   mcp:
-    api-key: ${MCP_API_KEY}          # McpClientConfig sends it as X-API-Key on every request
-  smoke-select: false                # true runs one hard-coded SELECT at startup
-  preview-token-secret: ${PREVIEW_TOKEN_SECRET}
-  preview-token-ttl: 5m
+    url: ${MCP_SERVER_URL:http://localhost:8081}
+    api-key: ${MCP_API_KEY}          # sent as X-API-Key on every request
+    connect-timeout: 10s
+    request-timeout: 60s
+  preview:
+    secret: ${PREVIEW_TOKEN_SECRET}  # at least 32 characters
+    ttl: 5m
 ```
 
 LLM providers are switched with Maven profiles (`-Popenrouter` default, `-Panthropic`, `-Pazure`, `-Pollama`), with no Java changes.

@@ -4,12 +4,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.example.mcpsql.client.dto.SelectResult;
 import io.modelcontextprotocol.client.McpSyncClient;
 import io.modelcontextprotocol.spec.McpSchema;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeEach;
@@ -24,17 +26,15 @@ class McpToolInvokerTest {
             {"columns":["id","name"],"rows":[[1,"a"],[2,null]],"rowCount":2,"truncated":true,"elapsedMs":5}
             """;
 
-    private final McpSyncClient client = namedClient("sql-client - sql");
+    private final McpSyncClient client = mock(McpSyncClient.class);
     private McpToolInvoker invoker;
 
-    private static McpSyncClient namedClient(String name) {
-        McpSyncClient client = mock(McpSyncClient.class);
-        when(client.getClientInfo()).thenReturn(new McpSchema.Implementation(name, "1.0"));
-        return client;
+    private void toolReturns(boolean isError, String text) {
+        toolReturns(client, isError, text);
     }
 
-    private void toolReturns(boolean isError, String text) {
-        when(client.callTool(any())).thenReturn(McpSchema.CallToolResult.builder()
+    private static void toolReturns(McpSyncClient target, boolean isError, String text) {
+        when(target.callTool(any())).thenReturn(McpSchema.CallToolResult.builder()
                 .content(List.of(new McpSchema.TextContent(text)))
                 .isError(isError)
                 .build());
@@ -48,7 +48,7 @@ class McpToolInvokerTest {
 
     @BeforeEach
     void setUp() {
-        invoker = new McpToolInvoker(List.of(client), JSON);
+        invoker = new McpToolInvoker(() -> client, JSON);
     }
 
     @Test
@@ -105,22 +105,74 @@ class McpToolInvokerTest {
     }
 
     @Test
-    void picksTheSqlConnectionFromSeveral() {
-        McpSyncClient other = namedClient("sql-client - other");
-        invoker = new McpToolInvoker(List.of(other, client), JSON);
+    void connectsOnFirstUse() {
         toolReturns(false, RESULT);
 
         invoker.call("run_select", Map.of("sql", "SELECT 1"), SelectResult.class);
 
-        verify(client).callTool(any());
+        verify(client).initialize();
     }
 
     @Test
-    void refusesToStartWithoutTheSqlConnection() {
-        McpSyncClient other = namedClient("sql-client - other");
+    void reportsAFailedConnectionTheSameWay() {
+        when(client.initialize()).thenThrow(new IllegalStateException("refused"));
 
-        assertThatThrownBy(() -> new McpToolInvoker(List.of(other), JSON))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("'sql'");
+        assertCallFails("MCP_UNAVAILABLE: The MCP server could not be reached");
+    }
+
+    @Test
+    void returnsPlainTextAsItIs() {
+        toolReturns(false, "shop.orders(order_id integer PK)");
+
+        assertThat(invoker.text("schema_overview", Map.of())).isEqualTo("shop.orders(order_id integer PK)");
+    }
+
+    @Test
+    void keepsAHealthyConnection() {
+        toolReturns(false, RESULT);
+
+        invoker.call("run_select", Map.of("sql", "SELECT 1"), SelectResult.class);
+        invoker.call("run_select", Map.of("sql", "SELECT 2"), SelectResult.class);
+
+        verify(client, times(1)).initialize();
+        verify(client).ping();
+    }
+
+    @Test
+    void replacesADeadConnectionBeforeCalling() {
+        McpSyncClient replacement = mock(McpSyncClient.class);
+        Iterator<McpSyncClient> connections = List.of(client, replacement).iterator();
+        invoker = new McpToolInvoker(connections::next, JSON);
+        toolReturns(false, RESULT);
+        toolReturns(replacement, false, RESULT);
+        invoker.call("run_select", Map.of("sql", "SELECT 1"), SelectResult.class);
+        when(client.ping()).thenThrow(new IllegalStateException("gone"));
+
+        invoker.call("run_select", Map.of("sql", "SELECT 2"), SelectResult.class);
+
+        verify(client).close();
+        verify(replacement).initialize();
+        verify(replacement).callTool(any());
+    }
+
+    @Test
+    void neverResendsAFailedCall() {
+        when(client.callTool(any())).thenThrow(new IllegalStateException("broken mid-call"));
+
+        assertCallFails("MCP_UNAVAILABLE: The MCP server could not be reached");
+
+        verify(client, times(1)).callTool(any());
+    }
+
+    @Test
+    void closesAConnectionThatFailedToStartAndTriesAgainNextTime() {
+        when(client.initialize()).thenThrow(new IllegalStateException("refused")).thenReturn(null);
+        toolReturns(false, RESULT);
+
+        assertCallFails("MCP_UNAVAILABLE: The MCP server could not be reached");
+        invoker.call("run_select", Map.of("sql", "SELECT 1"), SelectResult.class);
+
+        verify(client).close();
+        verify(client, times(2)).initialize();
     }
 }

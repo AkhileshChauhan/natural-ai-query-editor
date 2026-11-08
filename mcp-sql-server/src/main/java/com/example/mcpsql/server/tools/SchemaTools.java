@@ -28,7 +28,7 @@ public class SchemaTools {
         return audit.audited(context, "list_tables", null, null, schema::listTables, List::size);
     }
 
-    @Tool(name = "describe_table", description = "Describe one table: columns, foreign keys and indexes.")
+    @Tool(name = "describe_table", description = "Describe one table: columns, foreign keys, check constraints and indexes.")
     public TableDetail describeTable(
             @ToolParam(description = "Table name, such as shop.orders or orders") String table,
             ToolContext context) {
@@ -37,7 +37,7 @@ public class SchemaTools {
     }
 
     @Tool(name = "schema_overview",
-            description = "Every table, column and foreign key as compact text, plus the business rules for writing queries.",
+            description = "Every table, column, foreign key and check constraint as compact text, plus the business rules for writing queries.",
             resultConverter = PlainTextResultConverter.class)
     public String schemaOverview(ToolContext context) {
         return audit.audited(context, "schema_overview", null, null, schema::overview, text -> NO_ROWS);

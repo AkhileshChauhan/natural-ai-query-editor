@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" th:content="${_csrf.token}">
+    <meta name="csrf-header" th:content="${_csrf.headerName}">
+    <title>Natural AI Query Editor</title>
+    <link rel="stylesheet" th:href="@{/app.css}">
+</head>
+<body>
+<header class="topbar">
+    <h1>Natural AI Query Editor</h1>
+    <form class="signout" th:action="@{/logout}" method="post">
+        <span th:text="${username}">user</span>
+        <button type="submit" class="link">Sign out</button>
+    </form>
+</header>
+
+<div class="layout">
+    <aside class="sidebar">
+        <section>
+            <h2>Tables</h2>
+            <ul id="tables" class="plain-list"></ul>
+            <p id="tables-status" class="muted">Loading…</p>
+        </section>
+        <section>
+            <h2>History</h2>
+            <ul id="history" class="plain-list"></ul>
+            <p id="history-empty" class="muted">Nothing yet.</p>
+        </section>
+    </aside>
+
+    <main>
+        <section class="card">
+            <h2><label for="question">Ask a question</label></h2>
+            <textarea id="question" rows="3" maxlength="2000" placeholder="Top 5 customers by total spend in 2025"></textarea>
+            <div class="actions">
+                <button id="generate" type="button" class="primary">Generate SQL</button>
+            </div>
+            <div id="examples" class="examples" aria-label="Example questions"></div>
+        </section>
+
+        <section id="sql-card" class="card" hidden>
+            <div class="card-title">
+                <h2><label for="sql">Generated SQL</label></h2>
+                <span id="kind" class="badge"></span>
+            </div>
+            <p id="explanation"></p>
+            <p id="tables-used" class="muted"></p>
+            <textarea id="sql" rows="8" spellcheck="false" maxlength="20000"></textarea>
+            <div class="actions">
+                <button id="run" type="button" class="primary">Run</button>
+                <button id="regenerate" type="button">Regenerate</button>
+            </div>
+        </section>
+
+        <section id="result-card" class="card" hidden aria-live="polite">
+            <h2>Result</h2>
+            <div id="result"></div>
+        </section>
+    </main>
+</div>
+
+<script th:src="@{/app.js}"></script>
+</body>
+</html>
